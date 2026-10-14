@@ -60,47 +60,83 @@ console.log(result.serverId);  // '141'
 await reactor.close();         // session stays on disk
 ```
 
-## More than one reaction
+## 200+ reactions
+
+This is the whole reason the pool exists. Two commands.
+
+### 1. Pair the accounts
+
+```bash
+npx broken-channel-react pair --dir ./accounts --count 200
+```
+
+It walks them one at a time: you scan the QR (or pass `--numbers` and use a code), it saves the session, and moves to the next. Re-run with `--start` to resume if a few fail.
+
+Pairing with codes instead of a QR is faster for a batch:
+
+```bash
+npx broken-channel-react pair --dir ./accounts --count 200 \
+  --numbers 2348010000001,2348010000002,2348010000003
+```
+
+### 2. Fire the reaction
+
+```bash
+npx broken-channel-react react \
+  --link "https://whatsapp.com/channel/0029Vb6EHtR5Ui2gHMW9zX2x/141" \
+  --emoji 🔥
+```
+
+```
+Channel 0029Vb6EHtR5Ui2gHMW9zX2x, message 141
+Reacting with 🔥 from 200 account(s)
+waves of 25, 4 at a time
+
+  wave 1: 25 ok, 0 failed  (25 accounts)
+  wave 2: 50 ok, 0 failed  (25 accounts)
+  ...
+  wave 8: 200 ok, 0 failed  (25 accounts)
+
+result: 200 of 200 reacted in 8 wave(s), 96.4s
+```
+
+Check what is paired at any time:
+
+```bash
+npx broken-channel-react list --dir ./accounts
+```
+
+### Why waves matter
+
+200 accounts does **not** mean 200 open websockets. `reactBatched()` opens a wave, sends, closes the wave, then starts the next — so peak memory stays flat whether you have 20 accounts or 2,000.
 
 ```js
 const { ReactorPool } = require('broken-channel-react');
 
 const pool = new ReactorPool({
-  sessions: ['./accounts/a', './accounts/b', './accounts/c'],
-  concurrency: 3,
-  delayMs: 400,
+  sessions: listPaired('./accounts'),   // 200 directories
+  concurrency: 10,                      // 10 sending at once
+  batchSize: 25,                        // 25 sockets open per wave
+  delayMs: 350,
 });
 
-await pool.connect();
+const out = await pool.reactBatched(link, '🔥', {
+  onWave: (s) => console.log('wave ' + s.wave + ': ' + s.ok + ' ok'),
+});
 
-const out = await pool.react(
-  'https://whatsapp.com/channel/0029Vb6EHtR5Ui2gHMW9zX2x/141',
-  '🔥'
-);
-
-console.log(out.ok, 'of', out.total);   // 3 of 3
-console.log(out.results);               // per-account detail
-```
-
-Pair each account first, one at a time — a pool prints no QR by default because a screen full of codes is useless:
-
-```js
-// pair them one by one
-for (const dir of ['./accounts/a', './accounts/b', './accounts/c']) {
-  const r = new ChannelReactor({ authDir: dir });
-  await r.connect();     // scan
-  await r.close();
-}
+console.log(out.ok + ' of ' + out.total + ' reacted in ' + out.waves + ' waves');
 ```
 
 ### Fan-out behaviour
 
 - `concurrency` caps how many accounts send at once (default 4).
+- `batchSize` / `--wave` caps how many sockets are open at once (default 25 in the CLI).
 - One account failing does **not** stop the others. Each result is reported separately with a `code`.
-- The link is validated **once, up front**, so a bad link costs you zero sends.
+- The link is validated **once, up front**, so a bad link costs you zero connections.
+- A `401` on an account means it was logged out — re-pair just that one with `--start`.
 
 ```js
-const out = await pool.react(link, '🔥', { limit: 10 });
+const out = await pool.reactBatched(link, '🔥', { limit: 50 });
 
 const failed = out.results.filter(r => !r.ok);
 if (failed.length) {

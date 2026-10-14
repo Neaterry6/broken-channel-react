@@ -13,11 +13,15 @@
     },
     "./package.json": "./package.json"
   },
+  "bin": {
+    "broken-channel-react": "bin/cli.js"
+  },
   "files": [
     "index.js",
     "index.mjs",
     "index.d.ts",
     "src",
+    "bin",
     "README.md",
     "LICENSE"
   ],

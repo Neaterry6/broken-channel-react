@@ -44,6 +44,13 @@ class ReactorPool extends EventEmitter {
     this.delayMs = o.delayMs === undefined ? 350 : o.delayMs;
     this.baileysSpecifier = o.baileys;
     this.printQR = Boolean(o.printQR);
+    // How many sessions to hold open at once. A pool of 200 accounts opening
+    // 200 websockets at the same time is a memory problem on a small box, so
+    // large pools are processed in waves: open a batch, send, close it, next.
+    // 0 or null means "keep them all open" (fine for a handful).
+    this.batchSize = Number(o.batchSize) > 0 ? Number(o.batchSize) : 0;
+    /** Sessions paired and usable, once discovered. */
+    this._discovered = null;
 
     /** @type {ChannelReactor[]} */
     this.reactors = [];
@@ -59,23 +66,31 @@ class ReactorPool extends EventEmitter {
     return this.reactors.filter((r) => r.connected).length;
   }
 
+  /** Build a reactor for one session directory, wired to this pool's events. */
+  _makeReactor(authDir) {
+    const r = new ChannelReactor({
+      authDir,
+      baileys: this.baileysSpecifier,
+      printQR: this.printQR,
+    });
+    r.on('qr', (qr) => this.emit('qr', { session: authDir, qr }));
+    r.on('pairing-code', (code) => this.emit('pairing-code', { session: authDir, code }));
+    r.on('open', (info) => this.emit('open', { session: authDir, ...(info || {}) }));
+    r.on('error', (err) => this.emit('error', { session: authDir, error: err }));
+    return r;
+  }
+
   /**
    * Connect every session, up to `concurrency` at a time.
+   *
+   * When `batchSize` is set this connects only the first batch and leaves the
+   * rest for later waves — see reactBatched().
+   *
    * @returns {Promise<{connected:number, failed:Array<{session:string,error:string}>}>}
    */
   async connect() {
-    this.reactors = this.sessions.map((authDir) => {
-      const r = new ChannelReactor({
-        authDir,
-        baileys: this.baileysSpecifier,
-        printQR: this.printQR,
-      });
-      r.on('qr', (qr) => this.emit('qr', { session: authDir, qr }));
-      r.on('pairing-code', (code) => this.emit('pairing-code', { session: authDir, code }));
-      r.on('open', (info) => this.emit('open', { session: authDir, ...(info || {}) }));
-      r.on('error', (err) => this.emit('error', { session: authDir, error: err }));
-      return r;
-    });
+    const dirs = this.batchSize ? this.sessions.slice(0, this.batchSize) : this.sessions;
+    this.reactors = dirs.map((d) => this._makeReactor(d));
 
     const failed = [];
     let connected = 0;
@@ -143,6 +158,96 @@ class ReactorPool extends EventEmitter {
 
     const ok = results.filter((r) => r.ok).length;
     return { ok, failed: results.length - ok, total: results.length, results };
+  }
+
+  /**
+   * React across an arbitrarily large set of accounts, in waves.
+   *
+   * This is the entry point for real fan-out: 200 sessions does not mean 200
+   * open sockets. Each wave is connected, sends, and is closed before the next
+   * begins, so peak memory stays flat regardless of how many accounts there are.
+   *
+   * @param {string} link
+   * @param {string} emoji
+   * @param {object} [options]
+   * @param {number} [options.limit]  Cap the number of accounts used.
+   * @param {number} [options.waveSize] Override `batchSize` for this call.
+   * @param {function} [options.onWave] Called after each wave with a summary.
+   * @returns {Promise<{ok:number, failed:number, total:number, waves:number, results:Array}>}
+   */
+  async reactBatched(link, emoji, options) {
+    const o = options || {};
+    // Validate once up front so a bad link costs zero connections.
+    const target = parseMessageLink(link);
+    const text = String(emoji === undefined || emoji === null ? '' : emoji).trim();
+    if (!text) {
+      const e = new Error('An emoji is required.');
+      e.code = 'NO_EMOJI';
+      throw e;
+    }
+
+    const all = o.limit ? this.sessions.slice(0, o.limit) : this.sessions.slice();
+    const waveSize = Number(o.waveSize) > 0 ? Number(o.waveSize) : (this.batchSize || all.length);
+
+    const results = [];
+    let waves = 0;
+
+    for (let start = 0; start < all.length; start += waveSize) {
+      const wave = all.slice(start, start + waveSize);
+      waves += 1;
+
+      const reactors = wave.map((d) => this._makeReactor(d));
+      const failedToConnect = [];
+
+      await mapLimit(reactors, this.concurrency, async (r) => {
+        try {
+          await r.connect();
+        } catch (err) {
+          failedToConnect.push(r.authDir);
+          results.push({
+            session: r.authDir,
+            ok: false,
+            error: (err && err.message) || String(err),
+            code: (err && err.code) || 'CONNECT_FAILED',
+          });
+          this.emit('session-failed', { session: r.authDir, error: err });
+        }
+      });
+
+      const live = reactors.filter((r) => r.connected);
+      await mapLimit(live, this.concurrency, async (r) => {
+        try {
+          const out = await r.react(target.url, text);
+          results.push({ session: r.authDir, ok: true, emoji: out.emoji, serverId: out.serverId });
+          this.emit('reacted', { session: r.authDir, emoji: text, serverId: out.serverId });
+        } catch (err) {
+          results.push({
+            session: r.authDir,
+            ok: false,
+            error: (err && err.message) || String(err),
+            code: (err && err.code) || 'ERROR',
+          });
+          this.emit('react-failed', { session: r.authDir, error: err });
+        }
+      });
+
+      // Close the wave before opening the next one.
+      await Promise.all(reactors.map((r) => r.close().catch(() => {})));
+
+      const summary = {
+        wave: waves,
+        sessions: wave.length,
+        ok: results.filter((r) => r.ok).length,
+        failed: results.filter((r) => !r.ok).length,
+      };
+      this.emit('wave', summary);
+      if (typeof o.onWave === 'function') o.onWave(summary);
+
+      if (this.delayMs && start + waveSize < all.length) await sleep(this.delayMs);
+    }
+
+    const ok = results.filter((r) => r.ok).length;
+    return { ok, failed: results.length - ok, total: results.length, waves, results };
   }
 
   /**

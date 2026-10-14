@@ -469,3 +469,90 @@ test('mapLimit runs everything and never exceeds the cap', async () => {
   assert.equal(seen.length, 5);
   assert.ok(peak <= 2, 'peak was ' + peak);
 });
+
+// ------------------------------------------------------------ large fan-out
+
+test('reactBatched() splits 200 accounts into waves and keeps sockets bounded', async () => {
+  const f = await fake();
+  const sessions = Array.from({ length: 200 }, (_, i) => './acc-' + i);
+
+  const pool = new ReactorPool({
+    sessions,
+    baileys: FAKE,
+    concurrency: 10,
+    delayMs: 0,
+    batchSize: 25,
+  });
+
+  const waves = [];
+  const out = await pool.reactBatched(LINK, '🔥', { onWave: (s) => waves.push(s) });
+
+  assert.equal(out.total, 200);
+  assert.equal(out.ok, 200);
+  assert.equal(out.waves, 8, '200 accounts at 25 per wave is 8 waves');
+  assert.equal(waves.length, 8);
+
+  // The point of batching: sockets are opened and closed per wave, so no more
+  // than one wave is ever alive at once.
+  assert.equal(f.sockets.length, 200, 'one socket per account overall');
+
+  // Each account sent exactly one reaction.
+  assert.equal(f.sent.length, 200);
+  for (const s of f.sent) assert.equal(s.content.react.text, '🔥');
+});
+
+test('reactBatched() closes every socket before the next wave', async () => {
+  const f = await fake();
+  const sessions = Array.from({ length: 9 }, (_, i) => './w-' + i);
+
+  const pool = new ReactorPool({
+    sessions,
+    baileys: FAKE,
+    concurrency: 3,
+    delayMs: 0,
+    batchSize: 3,
+  });
+
+  await pool.reactBatched(LINK, '🔥');
+
+  // All nine sockets should have been ended by their wave closing.
+  assert.equal(f.sockets.length, 9);
+  assert.equal(f.sockets.filter((s) => s.ended).length, 9, 'every socket closed');
+});
+
+test('reactBatched() honours limit', async () => {
+  const f = await fake();
+  const sessions = Array.from({ length: 20 }, (_, i) => './l-' + i);
+  const pool = new ReactorPool({ sessions, baileys: FAKE, concurrency: 5, delayMs: 0, batchSize: 5 });
+
+  const out = await pool.reactBatched(LINK, '🔥', { limit: 7 });
+  assert.equal(out.total, 7);
+  assert.equal(f.sent.length, 7);
+});
+
+test('reactBatched() validates the link before opening anything', async () => {
+  const f = await fake();
+  const pool = new ReactorPool({ sessions: ['./a', './b'], baileys: FAKE, batchSize: 1 });
+
+  await assert.rejects(pool.reactBatched(PROFILE, '🔥'), (e) => /profile link/.test(e.message));
+  assert.equal(f.sockets.length, 0, 'no socket should have been opened');
+});
+
+test('reactBatched() keeps going when a wave has a dead account', async () => {
+  const f = await fake();
+  const sessions = ['./good-1', './good-2', './good-3', './good-4'];
+
+  const pool = new ReactorPool({
+    sessions, baileys: FAKE, concurrency: 2, delayMs: 0, batchSize: 2,
+  });
+
+  // Make the very first connection attempt fail.
+  f.control.failNextOpen = true;
+
+  const out = await pool.reactBatched(LINK, '🔥');
+
+  assert.equal(out.total, 4);
+  assert.equal(out.failed, 1, 'the one bad account is reported, the rest proceed');
+  assert.equal(out.ok, 3);
+  assert.equal(out.waves, 2);
+});
