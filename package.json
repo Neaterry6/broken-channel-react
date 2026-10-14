@@ -1,0 +1,60 @@
+{
+  "name": "broken-channel-react",
+  "version": "1.0.0",
+  "description": "React to WhatsApp Channel messages with emoji. No API key — pair your own WhatsApp account. Dual ESM + CJS, TypeScript types.",
+  "main": "index.js",
+  "module": "index.mjs",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "index.mjs",
+    "index.d.ts",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/offline.test.js"
+  },
+  "peerDependencies": {
+    "@whiskeysockets/baileys": ">=6.7.0"
+  },
+  "peerDependenciesMeta": {
+    "@whiskeysockets/baileys": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "whatsapp",
+    "whatsapp-channel",
+    "channel",
+    "reaction",
+    "react",
+    "emoji",
+    "baileys",
+    "newsletter",
+    "no-apikey",
+    "bot"
+  ],
+  "author": "Neaterry6",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Neaterry6/broken-channel-react.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Neaterry6/broken-channel-react/issues"
+  },
+  "homepage": "https://github.com/Neaterry6/broken-channel-react#readme"
+}
